@@ -14,16 +14,41 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================
+# MEDIAPIPE HANDS (FIXED IMPORT)
+# ============================================
+try:
+    # Try new import path first
+    import mediapipe.python.solutions.hands as mp_hands_module
+    import mediapipe.python.solutions.drawing_utils as mp_drawing
+    import mediapipe.python.solutions.drawing_styles as mp_drawing_styles
+    print("✅ MediaPipe: using mediapipe.python.solutions path")
+except ImportError:
+    try:
+        # Fallback to older style
+        mp_hands_module = mp.solutions.hands
+        print("✅ MediaPipe: using mp.solutions path")
+    except AttributeError:
+        # Last resort — try direct import
+        from mediapipe.python.solutions import hands as mp_hands_module
+        print("✅ MediaPipe: using direct hands import")
+
+# ============================================
 # AUTO-LOAD ALL MODELS
 # ============================================
 MODELS = {}
 
-# Find all *_robust.tflite files
-model_files = glob.glob("*_robust.tflite")
+# Use __file__ so it works regardless of working directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+model_files = glob.glob(os.path.join(BASE_DIR, "*_robust.tflite"))
+
+print("=" * 60)
+print(f"🔍 Looking for models in: {BASE_DIR}")
+print(f"📦 Found {len(model_files)} model files")
+print("=" * 60)
 
 for model_file in model_files:
     # Extract alphabet name from filename
-    alphabet_name = model_file.replace("_robust.tflite", "")
+    alphabet_name = os.path.basename(model_file).replace("_robust.tflite", "")
     
     try:
         interpreter = tf.lite.Interpreter(model_path=model_file)
@@ -43,10 +68,9 @@ print(f"📚 Available: {list(MODELS.keys())}")
 print("=" * 60)
 
 # ============================================
-# MEDIAPIPE HANDS
+# INITIALIZE MEDIAPIPE HANDS
 # ============================================
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
+hands = mp_hands_module.Hands(
     static_image_mode=False,
     max_num_hands=1,
     min_detection_confidence=0.5,
@@ -91,9 +115,16 @@ ALPHABET_DISPLAY = {
     'rre': 'ڑ',
 }
 
+# ============================================
+# ROUTES
+# ============================================
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({'status': 'OK', 'models': list(MODELS.keys())})
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'healthy', 'models_count': len(MODELS)})
 
 @app.route('/models', methods=['GET'])
 def get_models():
@@ -115,6 +146,10 @@ def detect():
         
         if not image_data:
             return jsonify({'error': 'No image data'}), 400
+
+        # Strip data URL prefix if present
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
 
         # Decode image
         image_bytes = base64.b64decode(image_data)
@@ -180,13 +215,20 @@ def detect():
         })
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
+# ============================================
+# START SERVER
+# ============================================
 if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
     print("🚀 ALPHABET DETECTION SERVER")
     print("=" * 60)
     print(f"📚 Loaded {len(MODELS)} alphabet models")
-    print(f"📡 Server: http://0.0.0.0:5000")
+    print(f"📡 Server: http://0.0.0.0:{port}")
     print("=" * 60)
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
