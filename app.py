@@ -1,9 +1,6 @@
 import os
 import gc
 
-# ============================================
-# MEMORY OPTIMIZATION - BEFORE TF/MP IMPORTS
-# ============================================
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -14,42 +11,29 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import cv2
 import numpy as np
 import base64
 import io
 import glob
 from PIL import Image
 import tensorflow as tf
+import mediapipe as mp
 
 # ============================================
-# MEDIAPIPE TOGGLE
+# MEDIAPIPE ENABLED — pinned version 0.10.7
 # ============================================
-# Set to True ONLY when server has 2 GB+ RAM
-# Keep False to keep server stable (dummy landmarks)
-USE_MEDIAPIPE = False
+USE_MEDIAPIPE = True
 
-hands = None
-if USE_MEDIAPIPE:
-    try:
-        import mediapipe as mp
-        try:
-            from mediapipe.python.solutions import hands as mp_hands_module
-        except ImportError:
-            mp_hands_module = mp.solutions.hands
-        hands = mp_hands_module.Hands(
-            static_image_mode=True,
-            max_num_hands=1,
-            model_complexity=0,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        print("✅ MediaPipe Hands initialized (lite mode)")
-    except Exception as e:
-        print(f"⚠️ MediaPipe failed: {e}")
-        hands = None
-        USE_MEDIAPIPE = False
-else:
-    print("⚠️ MediaPipe DISABLED — using fallback dummy landmarks")
+mp_hands_module = mp.solutions.hands
+hands = mp_hands_module.Hands(
+    static_image_mode=True,
+    max_num_hands=1,
+    model_complexity=0,           # lite mode = less memory
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+print("✅ MediaPipe Hands initialized (mediapipe 0.10.7, lite mode)")
 
 app = Flask(__name__)
 CORS(app)
@@ -79,7 +63,6 @@ print("=" * 60)
 
 
 def load_model(alphabet_name):
-    """Load a model on demand, cache with LRU eviction."""
     if alphabet_name in MODELS:
         return MODELS[alphabet_name]
     if alphabet_name not in MODEL_PATHS:
@@ -109,9 +92,6 @@ def load_model(alphabet_name):
         return None
 
 
-# ============================================
-# ALPHABET DISPLAY
-# ============================================
 ALPHABET_DISPLAY = {
     'alif': 'ا', 'bay': 'ب', 'tay': 'ت', 'thay': 'ث',
     'seen': 'س', 'sheen': 'ش', 'suaad': 'ص', 'zvad': 'ض',
@@ -124,9 +104,6 @@ ALPHABET_DISPLAY = {
 }
 
 
-# ============================================
-# ROUTES
-# ============================================
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
@@ -160,11 +137,7 @@ def health():
 def get_models():
     return jsonify({
         'models': [
-            {
-                'name': n,
-                'display': ALPHABET_DISPLAY.get(n, n),
-                'arabic': ALPHABET_DISPLAY.get(n, '?')
-            }
+            {'name': n, 'display': ALPHABET_DISPLAY.get(n, n), 'arabic': ALPHABET_DISPLAY.get(n, '?')}
             for n in MODEL_PATHS.keys()
         ],
         'count': len(MODEL_PATHS)
@@ -181,60 +154,42 @@ def detect():
         if not image_data:
             return jsonify({'error': 'No image data'}), 400
 
-        # Strip data URL prefix
+        if len(image_data) > 500_000:
+            return jsonify({
+                'hasHand': False, 'isAlphabet': False, 'confidence': 0.0,
+                'landmarks': [], 'alphabet': alphabet,
+                'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
+                'message': 'Image too large'
+            })
+
         if ',' in image_data:
             image_data = image_data.split(',')[1]
 
-        # ============================================
-        # EXTRACT LANDMARKS
-        # ============================================
-        if USE_MEDIAPIPE and hands is not None:
-            # Full MediaPipe path
-            import cv2
-            image_bytes = base64.b64decode(image_data)
-            image = Image.open(io.BytesIO(image_bytes))
-            image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
+        image_bytes = base64.b64decode(image_data)
+        image = Image.open(io.BytesIO(image_bytes))
+        image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
 
-            if not results.multi_hand_landmarks:
-                return jsonify({
-                    'hasHand': False,
-                    'isAlphabet': False,
-                    'confidence': 0.0,
-                    'landmarks': [],
-                    'alphabet': alphabet,
-                    'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
-                    'message': 'No hand detected'
-                })
+        results = hands.process(rgb)
 
-            landmarks = []
-            for hand_landmarks in results.multi_hand_landmarks:
-                for lm in hand_landmarks.landmark:
-                    landmarks.extend([lm.x, lm.y])
-        else:
-            # FALLBACK: dummy landmarks
-            # App will display skeleton overlay for demo purposes
-            landmarks = [
-                0.50, 0.55,   # wrist
-                0.45, 0.50, 0.42, 0.45, 0.40, 0.40, 0.39, 0.36,
-                0.50, 0.45, 0.50, 0.38, 0.50, 0.32, 0.50, 0.28,
-                0.55, 0.45, 0.56, 0.38, 0.57, 0.32, 0.58, 0.28,
-                0.60, 0.45, 0.62, 0.38, 0.64, 0.33, 0.66, 0.30,
-                0.65, 0.48, 0.68, 0.43, 0.71, 0.40, 0.73, 0.38,
-            ]
+        if not results.multi_hand_landmarks:
+            return jsonify({
+                'hasHand': False, 'isAlphabet': False, 'confidence': 0.0,
+                'landmarks': [], 'alphabet': alphabet,
+                'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
+                'message': 'No hand detected'
+            })
 
-        # ============================================
-        # RUN TFLITE MODEL
-        # ============================================
+        landmarks = []
+        for hl in results.multi_hand_landmarks:
+            for lm in hl.landmark:
+                landmarks.extend([lm.x, lm.y])
+
         model_data = load_model(alphabet)
         if model_data is None:
             return jsonify({
-                'hasHand': True,
-                'isAlphabet': False,
-                'confidence': 0.0,
-                'landmarks': landmarks,
-                'alphabet': alphabet,
+                'hasHand': True, 'isAlphabet': False, 'confidence': 0.0,
+                'landmarks': landmarks, 'alphabet': alphabet,
                 'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
                 'message': f'Model {alphabet} not found'
             })
@@ -250,13 +205,10 @@ def detect():
         score = float(prediction[0][0])
 
         return jsonify({
-            'hasHand': True,
-            'isAlphabet': score > 0.5,
-            'confidence': score,
-            'landmarks': landmarks,
-            'alphabet': alphabet,
+            'hasHand': True, 'isAlphabet': score > 0.5, 'confidence': score,
+            'landmarks': landmarks, 'alphabet': alphabet,
             'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
-            'message': 'Success' if USE_MEDIAPIPE else 'Fallback mode'
+            'message': 'Success'
         })
 
     except Exception as e:
@@ -264,13 +216,17 @@ def detect():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
+        try:
+            del image_bytes, image, image_cv, rgb
+        except:
+            pass
         gc.collect()
 
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
-    print("🚀 ALPHABET DETECTION SERVER")
+    print("🚀 SIGN SPEAK SERVER")
     print("=" * 60)
     print(f"📚 Registered {len(MODEL_PATHS)} models")
     print(f"🎯 MediaPipe enabled: {USE_MEDIAPIPE}")
