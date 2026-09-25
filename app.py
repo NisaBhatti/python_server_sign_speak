@@ -1,6 +1,8 @@
 import os
+import gc
+
 # ============================================
-# MEMORY OPTIMIZATION - MUST BE BEFORE TF/MP IMPORT
+# MEMORY OPTIMIZATION - BEFORE TF/MP IMPORTS
 # ============================================
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -8,6 +10,7 @@ os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -20,7 +23,7 @@ import tensorflow as tf
 import glob
 
 # ============================================
-# MEDIAPIPE IMPORT - FIXED FOR NEWER VERSIONS
+# MEDIAPIPE IMPORT - FIXED
 # ============================================
 import mediapipe as mp
 
@@ -44,15 +47,16 @@ CORS(app)
 # ============================================
 # LAZY MODEL LOADING (MEMORY SAVER)
 # ============================================
-MODELS = {}          # Loaded models cache
-MODEL_PATHS = {}     # All model paths (not loaded yet)
+MAX_CACHED_MODELS = 2       # Only keep 2 models in RAM at once
+MODELS = {}                 # Loaded models cache
+MODEL_PATHS = {}            # All model paths (registered, not loaded)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 model_files = glob.glob(os.path.join(BASE_DIR, "*_robust.tflite"))
 
 print("=" * 60)
 print(f"🔍 Model dir: {BASE_DIR}")
-print(f"📦 Found {len(model_files)} models")
+print(f"📦 Found {len(model_files)} model files")
 print("=" * 60)
 
 for model_file in model_files:
@@ -60,16 +64,28 @@ for model_file in model_files:
     MODEL_PATHS[alphabet_name] = model_file
     print(f"📁 Registered: {alphabet_name}")
 
-print(f"✅ Registered {len(MODEL_PATHS)} models (lazy load)")
+print(f"✅ Registered {len(MODEL_PATHS)} models (lazy load, cache={MAX_CACHED_MODELS})")
 print("=" * 60)
 
 
 def load_model(alphabet_name):
-    """Load a model on demand and cache it."""
+    """Load a model on demand, cache with LRU eviction."""
     if alphabet_name in MODELS:
         return MODELS[alphabet_name]
+
     if alphabet_name not in MODEL_PATHS:
         return None
+
+    # Evict oldest cached model if cache is full
+    if len(MODELS) >= MAX_CACHED_MODELS:
+        oldest = next(iter(MODELS))
+        try:
+            del MODELS[oldest]
+            gc.collect()
+            print(f"🗑️ Evicted: {oldest}")
+        except Exception as e:
+            print(f"⚠️ Eviction failed: {e}")
+
     try:
         interpreter = tf.lite.Interpreter(model_path=MODEL_PATHS[alphabet_name])
         interpreter.allocate_tensors()
@@ -78,7 +94,7 @@ def load_model(alphabet_name):
             'input_details': interpreter.get_input_details(),
             'output_details': interpreter.get_output_details()
         }
-        print(f"✅ Loaded: {alphabet_name}")
+        print(f"✅ Loaded: {alphabet_name}  (cache size: {len(MODELS)})")
         return MODELS[alphabet_name]
     except Exception as e:
         print(f"❌ Failed to load {alphabet_name}: {e}")
@@ -86,15 +102,17 @@ def load_model(alphabet_name):
 
 
 # ============================================
-# INITIALIZE MEDIAPIPE HANDS
+# INITIALIZE MEDIAPIPE HANDS (LITE MODE)
 # ============================================
 hands = mp_hands_module.Hands(
-    static_image_mode=False,
+    static_image_mode=True,
     max_num_hands=1,
+    model_complexity=0,             # 0 = lite (lowest memory)
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
-print("✅ MediaPipe Hands initialized!")
+print("✅ MediaPipe Hands initialized (lite mode)")
+
 
 # ============================================
 # ALPHABET DISPLAY MAP
@@ -110,9 +128,18 @@ ALPHABET_DISPLAY = {
     'zal': 'ذ', 'khay': 'خ', 'rre': 'ڑ',
 }
 
+
 # ============================================
 # ROUTES
 # ============================================
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({
+        'status': 'SignSpeak API',
+        'endpoints': ['/ping', '/health', '/models', '/detect']
+    })
+
+
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({
@@ -120,6 +147,7 @@ def ping():
         'models': list(MODEL_PATHS.keys()),
         'loaded': list(MODELS.keys())
     })
+
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -129,22 +157,21 @@ def health():
         'loaded_count': len(MODELS)
     })
 
+
 @app.route('/models', methods=['GET'])
 def get_models():
     return jsonify({
         'models': [
-            {'name': n, 'display': ALPHABET_DISPLAY.get(n, n), 'arabic': ALPHABET_DISPLAY.get(n, '?')}
+            {
+                'name': n,
+                'display': ALPHABET_DISPLAY.get(n, n),
+                'arabic': ALPHABET_DISPLAY.get(n, '?')
+            }
             for n in MODEL_PATHS.keys()
         ],
         'count': len(MODEL_PATHS)
     })
 
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({
-        'status': 'SignSpeak API',
-        'endpoints': ['/ping', '/health', '/models', '/detect']
-    })
 
 @app.route('/detect', methods=['POST'])
 def detect():
@@ -156,39 +183,50 @@ def detect():
         if not image_data:
             return jsonify({'error': 'No image data'}), 400
 
+        # Strip data URL prefix if present
         if ',' in image_data:
             image_data = image_data.split(',')[1]
 
+        # Decode image
         image_bytes = base64.b64decode(image_data)
         image = Image.open(io.BytesIO(image_bytes))
         image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
 
+        # MediaPipe hand detection
         results = hands.process(rgb)
 
         if not results.multi_hand_landmarks:
             return jsonify({
-                'hasHand': False, 'isAlphabet': False, 'confidence': 0.0,
-                'landmarks': [], 'alphabet': alphabet,
+                'hasHand': False,
+                'isAlphabet': False,
+                'confidence': 0.0,
+                'landmarks': [],
+                'alphabet': alphabet,
                 'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
                 'message': 'No hand detected'
             })
 
+        # Extract landmarks
         landmarks = []
-        for hl in results.multi_hand_landmarks:
-            for lm in hl.landmark:
+        for hand_landmarks in results.multi_hand_landmarks:
+            for lm in hand_landmarks.landmark:
                 landmarks.extend([lm.x, lm.y])
 
-        # Lazy load the model
+        # Lazy load the requested model
         model_data = load_model(alphabet)
         if model_data is None:
             return jsonify({
-                'hasHand': True, 'isAlphabet': False, 'confidence': 0.0,
-                'landmarks': landmarks, 'alphabet': alphabet,
+                'hasHand': True,
+                'isAlphabet': False,
+                'confidence': 0.0,
+                'landmarks': landmarks,
+                'alphabet': alphabet,
                 'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
                 'message': f'Model {alphabet} not found'
             })
 
+        # Run inference
         features = np.array(landmarks, dtype=np.float32).reshape(1, -1)
         interpreter = model_data['interpreter']
         input_details = model_data['input_details']
@@ -200,8 +238,11 @@ def detect():
         score = float(prediction[0][0])
 
         return jsonify({
-            'hasHand': True, 'isAlphabet': score > 0.5, 'confidence': score,
-            'landmarks': landmarks, 'alphabet': alphabet,
+            'hasHand': True,
+            'isAlphabet': score > 0.5,
+            'confidence': score,
+            'landmarks': landmarks,
+            'alphabet': alphabet,
             'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
             'message': 'Success'
         })
@@ -211,7 +252,14 @@ def detect():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+    finally:
+        # Force garbage collection after every request
+        gc.collect()
 
+
+# ============================================
+# START SERVER (local dev only; gunicorn runs in prod)
+# ============================================
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     print("=" * 60)

@@ -2,7 +2,7 @@ flask
 flask-cors
 opencv-python-headless
 mediapipe==0.10.14
-numpy
+numpy==1.26.4
 Pillow
 tensorflow-cpu
 gunicorn
