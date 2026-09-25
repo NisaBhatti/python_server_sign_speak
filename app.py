@@ -1,5 +1,6 @@
 import os
 import gc
+import time
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -21,19 +22,16 @@ import tensorflow as tf
 import mediapipe as mp
 
 # ============================================
-# MEDIAPIPE ENABLED — pinned version 0.10.7
+# MEDIAPIPE HANDS — TRACKING MODE (faster)
 # ============================================
-USE_MEDIAPIPE = True
-
-mp_hands_module = mp.solutions.hands
-hands = mp_hands_module.Hands(
-    static_image_mode=True,
+hands = mp.solutions.hands.Hands(
+    static_image_mode=False,        # tracking = faster
     max_num_hands=1,
-    model_complexity=0,           # lite mode = less memory
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+    model_complexity=0,             # lite = less memory
+    min_detection_confidence=0.4,
+    min_tracking_confidence=0.3
 )
-print("✅ MediaPipe Hands initialized (mediapipe 0.10.7, lite mode)")
+print("✅ MediaPipe Hands (tracking mode, lite)")
 
 app = Flask(__name__)
 CORS(app)
@@ -48,18 +46,11 @@ MODEL_PATHS = {}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 model_files = glob.glob(os.path.join(BASE_DIR, "*_robust.tflite"))
 
-print("=" * 60)
-print(f"🔍 Model dir: {BASE_DIR}")
-print(f"📦 Found {len(model_files)} model files")
-print("=" * 60)
-
 for model_file in model_files:
     alphabet_name = os.path.basename(model_file).replace("_robust.tflite", "")
     MODEL_PATHS[alphabet_name] = model_file
-    print(f"📁 Registered: {alphabet_name}")
 
 print(f"✅ Registered {len(MODEL_PATHS)} models (lazy load, cache={MAX_CACHED_MODELS})")
-print("=" * 60)
 
 
 def load_model(alphabet_name):
@@ -67,16 +58,13 @@ def load_model(alphabet_name):
         return MODELS[alphabet_name]
     if alphabet_name not in MODEL_PATHS:
         return None
-
     if len(MODELS) >= MAX_CACHED_MODELS:
         oldest = next(iter(MODELS))
         try:
             del MODELS[oldest]
             gc.collect()
-            print(f"🗑️ Evicted: {oldest}")
-        except Exception as e:
-            print(f"⚠️ Eviction failed: {e}")
-
+        except Exception:
+            pass
     try:
         interpreter = tf.lite.Interpreter(model_path=MODEL_PATHS[alphabet_name])
         interpreter.allocate_tensors()
@@ -85,22 +73,21 @@ def load_model(alphabet_name):
             'input_details': interpreter.get_input_details(),
             'output_details': interpreter.get_output_details()
         }
-        print(f"✅ Loaded: {alphabet_name}  (cache: {len(MODELS)})")
+        print(f"✅ Loaded: {alphabet_name}")
         return MODELS[alphabet_name]
     except Exception as e:
-        print(f"❌ Failed to load {alphabet_name}: {e}")
+        print(f"❌ Failed: {alphabet_name}: {e}")
         return None
 
 
 ALPHABET_DISPLAY = {
-    'alif': 'ا', 'bay': 'ب', 'tay': 'ت', 'thay': 'ث',
-    'seen': 'س', 'sheen': 'ش', 'suaad': 'ص', 'zvad': 'ض',
-    'toayn': 'ط', 'zoyn': 'ظ', 'ain': 'ع', 'ghain': 'غ',
-    'fe': 'ف', 'quaaf': 'ق', 'kaf': 'ك', 'gaf': 'گ',
-    'lam': 'ل', 'mim': 'م', 'noon': 'ن', 'vao': 'و',
+    'alif': 'ا', 'bay': 'ب', 'tay': 'ت', 'thay': 'ث', 'seen': 'س',
+    'sheen': 'ش', 'suaad': 'ص', 'zvad': 'ض', 'toayn': 'ط', 'zoyn': 'ظ',
+    'ain': 'ع', 'ghain': 'غ', 'fe': 'ف', 'quaaf': 'ق', 'kaf': 'ك',
+    'gaf': 'گ', 'lam': 'ل', 'mim': 'م', 'noon': 'ن', 'vao': 'و',
     'hamza': 'ء', 'choti_ye': 'ی', 'bari_ye': 'ے', 'ray': 'ر',
-    'rray': 'ڑ', 'zay': 'ز', 'dal': 'د', 'daal': 'ڈ',
-    'zal': 'ذ', 'khay': 'خ', 'rre': 'ڑ',
+    'rray': 'ڑ', 'zay': 'ز', 'dal': 'د', 'daal': 'ڈ', 'zal': 'ذ',
+    'khay': 'خ', 'rre': 'ڑ',
 }
 
 
@@ -108,8 +95,7 @@ ALPHABET_DISPLAY = {
 def index():
     return jsonify({
         'status': 'SignSpeak API',
-        'mediapipe_enabled': USE_MEDIAPIPE,
-        'endpoints': ['/ping', '/health', '/models', '/detect']
+        'endpoints': ['/ping', '/health', '/models', '/warmup/<alphabet>', '/detect']
     })
 
 
@@ -117,7 +103,6 @@ def index():
 def ping():
     return jsonify({
         'status': 'OK',
-        'mediapipe': USE_MEDIAPIPE,
         'models': list(MODEL_PATHS.keys()),
         'loaded': list(MODELS.keys())
     })
@@ -127,7 +112,6 @@ def ping():
 def health():
     return jsonify({
         'status': 'healthy',
-        'mediapipe_enabled': USE_MEDIAPIPE,
         'models_count': len(MODEL_PATHS),
         'loaded_count': len(MODELS)
     })
@@ -144,8 +128,21 @@ def get_models():
     })
 
 
+@app.route('/warmup/<alphabet>', methods=['GET'])
+def warmup(alphabet):
+    """Preload model so first detection is instant."""
+    t0 = time.time()
+    m = load_model(alphabet)
+    elapsed = time.time() - t0
+    if m:
+        print(f"🔥 Warmup {alphabet} took {elapsed:.2f}s")
+        return jsonify({'status': 'ready', 'alphabet': alphabet, 'time': round(elapsed, 2)})
+    return jsonify({'status': 'not_found', 'alphabet': alphabet}), 404
+
+
 @app.route('/detect', methods=['POST'])
 def detect():
+    t0 = time.time()
     try:
         data = request.json
         image_data = data.get('image')
@@ -173,6 +170,8 @@ def detect():
         results = hands.process(rgb)
 
         if not results.multi_hand_landmarks:
+            elapsed = time.time() - t0
+            print(f"⏱️ /detect no hand ({elapsed:.2f}s)")
             return jsonify({
                 'hasHand': False, 'isAlphabet': False, 'confidence': 0.0,
                 'landmarks': [], 'alphabet': alphabet,
@@ -195,18 +194,21 @@ def detect():
             })
 
         features = np.array(landmarks, dtype=np.float32).reshape(1, -1)
-        interpreter = model_data['interpreter']
-        input_details = model_data['input_details']
-        output_details = model_data['output_details']
+        m = model_data
+        m['interpreter'].set_tensor(m['input_details'][0]['index'], features)
+        m['interpreter'].invoke()
+        pred = m['interpreter'].get_tensor(m['output_details'][0]['index'])
+        score = float(pred[0][0])
 
-        interpreter.set_tensor(input_details[0]['index'], features)
-        interpreter.invoke()
-        prediction = interpreter.get_tensor(output_details[0]['index'])
-        score = float(prediction[0][0])
+        elapsed = time.time() - t0
+        print(f"⏱️ /detect ({alphabet}) took {elapsed:.2f}s, score={score:.2f}")
 
         return jsonify({
-            'hasHand': True, 'isAlphabet': score > 0.5, 'confidence': score,
-            'landmarks': landmarks, 'alphabet': alphabet,
+            'hasHand': True,
+            'isAlphabet': score > 0.5,
+            'confidence': score,
+            'landmarks': landmarks,
+            'alphabet': alphabet,
             'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
             'message': 'Success'
         })
@@ -216,20 +218,10 @@ def detect():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
-        try:
-            del image_bytes, image, image_cv, rgb
-        except:
-            pass
         gc.collect()
 
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    print("=" * 60)
-    print("🚀 SIGN SPEAK SERVER")
-    print("=" * 60)
-    print(f"📚 Registered {len(MODEL_PATHS)} models")
-    print(f"🎯 MediaPipe enabled: {USE_MEDIAPIPE}")
-    print(f"📡 Server: http://0.0.0.0:{port}")
-    print("=" * 60)
+    print(f"🚀 Server on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
