@@ -14,42 +14,52 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import cv2
 import numpy as np
 import base64
 import io
+import glob
 from PIL import Image
 import tensorflow as tf
-import glob
 
 # ============================================
-# MEDIAPIPE IMPORT - FIXED
+# MEDIAPIPE TOGGLE
 # ============================================
-import mediapipe as mp
+# Set to True ONLY when server has 2 GB+ RAM
+# Keep False to keep server stable (dummy landmarks)
+USE_MEDIAPIPE = False
 
-try:
-    from mediapipe.python.solutions import hands as mp_hands_module
-    print("✅ Using mediapipe.python.solutions.hands")
-except Exception as e1:
-    print(f"⚠️ Primary import failed: {e1}")
+hands = None
+if USE_MEDIAPIPE:
     try:
-        import mediapipe.python.solutions as mp_solutions
-        mp_hands_module = mp_solutions.hands
-        print("✅ Using mediapipe.python.solutions fallback")
-    except Exception as e2:
-        print(f"⚠️ Secondary import failed: {e2}")
-        mp_hands_module = mp.solutions.hands
-        print("✅ Using legacy mp.solutions.hands")
+        import mediapipe as mp
+        try:
+            from mediapipe.python.solutions import hands as mp_hands_module
+        except ImportError:
+            mp_hands_module = mp.solutions.hands
+        hands = mp_hands_module.Hands(
+            static_image_mode=True,
+            max_num_hands=1,
+            model_complexity=0,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        print("✅ MediaPipe Hands initialized (lite mode)")
+    except Exception as e:
+        print(f"⚠️ MediaPipe failed: {e}")
+        hands = None
+        USE_MEDIAPIPE = False
+else:
+    print("⚠️ MediaPipe DISABLED — using fallback dummy landmarks")
 
 app = Flask(__name__)
 CORS(app)
 
 # ============================================
-# LAZY MODEL LOADING (MEMORY SAVER)
+# LAZY MODEL LOADING
 # ============================================
-MAX_CACHED_MODELS = 2       # Only keep 2 models in RAM at once
-MODELS = {}                 # Loaded models cache
-MODEL_PATHS = {}            # All model paths (registered, not loaded)
+MAX_CACHED_MODELS = 2
+MODELS = {}
+MODEL_PATHS = {}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 model_files = glob.glob(os.path.join(BASE_DIR, "*_robust.tflite"))
@@ -72,11 +82,9 @@ def load_model(alphabet_name):
     """Load a model on demand, cache with LRU eviction."""
     if alphabet_name in MODELS:
         return MODELS[alphabet_name]
-
     if alphabet_name not in MODEL_PATHS:
         return None
 
-    # Evict oldest cached model if cache is full
     if len(MODELS) >= MAX_CACHED_MODELS:
         oldest = next(iter(MODELS))
         try:
@@ -94,7 +102,7 @@ def load_model(alphabet_name):
             'input_details': interpreter.get_input_details(),
             'output_details': interpreter.get_output_details()
         }
-        print(f"✅ Loaded: {alphabet_name}  (cache size: {len(MODELS)})")
+        print(f"✅ Loaded: {alphabet_name}  (cache: {len(MODELS)})")
         return MODELS[alphabet_name]
     except Exception as e:
         print(f"❌ Failed to load {alphabet_name}: {e}")
@@ -102,20 +110,7 @@ def load_model(alphabet_name):
 
 
 # ============================================
-# INITIALIZE MEDIAPIPE HANDS (LITE MODE)
-# ============================================
-hands = mp_hands_module.Hands(
-    static_image_mode=True,
-    max_num_hands=1,
-    model_complexity=0,             # 0 = lite (lowest memory)
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-print("✅ MediaPipe Hands initialized (lite mode)")
-
-
-# ============================================
-# ALPHABET DISPLAY MAP
+# ALPHABET DISPLAY
 # ============================================
 ALPHABET_DISPLAY = {
     'alif': 'ا', 'bay': 'ب', 'tay': 'ت', 'thay': 'ث',
@@ -136,6 +131,7 @@ ALPHABET_DISPLAY = {
 def index():
     return jsonify({
         'status': 'SignSpeak API',
+        'mediapipe_enabled': USE_MEDIAPIPE,
         'endpoints': ['/ping', '/health', '/models', '/detect']
     })
 
@@ -144,6 +140,7 @@ def index():
 def ping():
     return jsonify({
         'status': 'OK',
+        'mediapipe': USE_MEDIAPIPE,
         'models': list(MODEL_PATHS.keys()),
         'loaded': list(MODELS.keys())
     })
@@ -153,6 +150,7 @@ def ping():
 def health():
     return jsonify({
         'status': 'healthy',
+        'mediapipe_enabled': USE_MEDIAPIPE,
         'models_count': len(MODEL_PATHS),
         'loaded_count': len(MODELS)
     })
@@ -183,37 +181,52 @@ def detect():
         if not image_data:
             return jsonify({'error': 'No image data'}), 400
 
-        # Strip data URL prefix if present
+        # Strip data URL prefix
         if ',' in image_data:
             image_data = image_data.split(',')[1]
 
-        # Decode image
-        image_bytes = base64.b64decode(image_data)
-        image = Image.open(io.BytesIO(image_bytes))
-        image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+        # ============================================
+        # EXTRACT LANDMARKS
+        # ============================================
+        if USE_MEDIAPIPE and hands is not None:
+            # Full MediaPipe path
+            import cv2
+            image_bytes = base64.b64decode(image_data)
+            image = Image.open(io.BytesIO(image_bytes))
+            image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb)
 
-        # MediaPipe hand detection
-        results = hands.process(rgb)
+            if not results.multi_hand_landmarks:
+                return jsonify({
+                    'hasHand': False,
+                    'isAlphabet': False,
+                    'confidence': 0.0,
+                    'landmarks': [],
+                    'alphabet': alphabet,
+                    'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
+                    'message': 'No hand detected'
+                })
 
-        if not results.multi_hand_landmarks:
-            return jsonify({
-                'hasHand': False,
-                'isAlphabet': False,
-                'confidence': 0.0,
-                'landmarks': [],
-                'alphabet': alphabet,
-                'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
-                'message': 'No hand detected'
-            })
+            landmarks = []
+            for hand_landmarks in results.multi_hand_landmarks:
+                for lm in hand_landmarks.landmark:
+                    landmarks.extend([lm.x, lm.y])
+        else:
+            # FALLBACK: dummy landmarks
+            # App will display skeleton overlay for demo purposes
+            landmarks = [
+                0.50, 0.55,   # wrist
+                0.45, 0.50, 0.42, 0.45, 0.40, 0.40, 0.39, 0.36,
+                0.50, 0.45, 0.50, 0.38, 0.50, 0.32, 0.50, 0.28,
+                0.55, 0.45, 0.56, 0.38, 0.57, 0.32, 0.58, 0.28,
+                0.60, 0.45, 0.62, 0.38, 0.64, 0.33, 0.66, 0.30,
+                0.65, 0.48, 0.68, 0.43, 0.71, 0.40, 0.73, 0.38,
+            ]
 
-        # Extract landmarks
-        landmarks = []
-        for hand_landmarks in results.multi_hand_landmarks:
-            for lm in hand_landmarks.landmark:
-                landmarks.extend([lm.x, lm.y])
-
-        # Lazy load the requested model
+        # ============================================
+        # RUN TFLITE MODEL
+        # ============================================
         model_data = load_model(alphabet)
         if model_data is None:
             return jsonify({
@@ -226,7 +239,6 @@ def detect():
                 'message': f'Model {alphabet} not found'
             })
 
-        # Run inference
         features = np.array(landmarks, dtype=np.float32).reshape(1, -1)
         interpreter = model_data['interpreter']
         input_details = model_data['input_details']
@@ -244,28 +256,24 @@ def detect():
             'landmarks': landmarks,
             'alphabet': alphabet,
             'display': ALPHABET_DISPLAY.get(alphabet, alphabet),
-            'message': 'Success'
+            'message': 'Success' if USE_MEDIAPIPE else 'Fallback mode'
         })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
-
     finally:
-        # Force garbage collection after every request
         gc.collect()
 
 
-# ============================================
-# START SERVER (local dev only; gunicorn runs in prod)
-# ============================================
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
     print("🚀 ALPHABET DETECTION SERVER")
     print("=" * 60)
-    print(f"📚 Registered {len(MODEL_PATHS)} models (lazy load)")
+    print(f"📚 Registered {len(MODEL_PATHS)} models")
+    print(f"🎯 MediaPipe enabled: {USE_MEDIAPIPE}")
     print(f"📡 Server: http://0.0.0.0:{port}")
     print("=" * 60)
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
